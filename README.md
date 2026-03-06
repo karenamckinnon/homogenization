@@ -3,15 +3,12 @@
 ![PyPI version](https://img.shields.io/pypi/v/homogenization.svg)
 [![Documentation Status](https://readthedocs.org/projects/homogenization/badge/?version=latest)](https://homogenization.readthedocs.io/en/latest/?version=latest)
 
-Code to reference climate time series to a reference and identify changepoints using PELT
+Code to homogenize ERA5 and HadISDH near-surface specific humidity data using PELT (Killick et al, 2012, JASA) and a constrained climate model simulation. Analysis is documented in McKinnon et al, submitted to GRL. 
 
 * PyPI package: https://pypi.org/project/homogenization/
 * Free software: MIT License
 * Documentation: https://homogenization.readthedocs.io.
 
-## Features
-
-* TODO
 
 ## Credits
 
