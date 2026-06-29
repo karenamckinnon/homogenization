@@ -55,30 +55,52 @@ def normalize_delta(da, do_std=True):
     return da_norm
 
 
-def get_R_fn_envcpt_ar1():
+
+def get_R_fn_envcpt_ar1(models=('meanar1', 'trendar1')):
     """
-    Get rpy2 function object for the envcpt model
+    Get rpy2 function object for the EnvCpt AR(1) model family.
 
     Parameters
     ----------
-    None
+    models : tuple or list of str
+        EnvCpt model names to allow. Options:
+        - 'meanar1'  -> EnvCpt model 5
+        - 'trendar1' -> EnvCpt model 11
 
     Returns
     -------
     fn : rpy2 function
-        Function to fit the two AR(1) models on a time series
+        Function to fit the selected AR(1) EnvCpt model(s) on a time series.
     """
 
     from rpy2 import robjects as ro
     from rpy2.robjects import numpy2ri
+
+    model_map = {
+        'meanar1': 5,
+        'trendar1': 11,
+    }
+
+    if isinstance(models, str):
+        models = [models]
+
+    invalid = [m for m in models if m not in model_map]
+    if invalid:
+        raise ValueError(
+            f'Invalid EnvCpt model(s): {invalid}. '
+            f'Valid options are: {list(model_map)}'
+        )
+
+    model_codes = [model_map[m] for m in models]
+    model_codes_r = ', '.join(str(code) for code in model_codes)
 
     # Activate python - R
     numpy2ri.activate()
 
     ro.r('library(EnvCpt)')
 
-    ro.r('''
-    envcpt_best_model_cp_ar1_only <- function(y, minseglen = 24) {
+    ro.r(f'''
+    envcpt_best_model_cp_ar1_only <- function(y, minseglen = 24) {{
       y2  <- as.numeric(y)
 
       # default outputs
@@ -86,25 +108,26 @@ def get_R_fn_envcpt_ar1():
       cps   <- integer(0)
       params_out <- list()
 
-      if (length(y2) < max(4, 2*minseglen)) {
+      if (length(y2) < max(4, 2*minseglen)) {{
         return(list(model_name=model_name, changepoints=cps, params=params_out))
-      }
+      }}
 
-      fit <- EnvCpt::envcpt(y2, minseglen=minseglen, models=c(5, 11))
+      fit <- EnvCpt::envcpt(y2, minseglen=minseglen, models=c({model_codes_r}))
       nm <- names(which.min(BIC(fit)))
 
       model_name <- if (length(nm)) nm[[1]] else NA_character_
       comp <- fit[[model_name]]
 
       # comp is usually a 'cpt' S4 object
-      if (methods::is(comp, "cpt") | methods::is(comp, "cpt.reg")) {
+      if (methods::is(comp, "cpt") | methods::is(comp, "cpt.reg")) {{
         cps <- comp@cpts
         pe <- comp@param.est
         if (!is.null(pe)) params_out <- as.list(pe)
-      }
+      }}
       list(model_name=model_name, changepoints=cps, params=params_out)
-    }
+    }}
     ''')
+
     fn = ro.globalenv['envcpt_best_model_cp_ar1_only']
 
     return fn
@@ -113,29 +136,26 @@ def get_R_fn_envcpt_ar1():
 def run_ts_with_r(y, fn, minseglen=24):
     """
     Run the changepoint detection on a single time series.
-
-    Parameters
-    ----------
-    y : numpy.array
-        The time series to check for changepoints
-    fn : rpy2 function
-        Function to fit the two AR(1) models on a time series
-
-    Returns
-    -------
-    model : str
-        The name of the selected model (via minimizing BIC)
-    cp_idx : np.array
-        The indices of changepoints. All will contain len(y) - 1 as last changepoint
-    param_dict : dictionary
-        Parameter names and associated values for each fitted segment
     """
 
     from rpy2 import robjects as ro
     from rpy2.rinterface_lib.sexp import NULLType
 
-    # Fit model
-    res = fn(ro.FloatVector(y), minseglen=minseglen)
+    y = np.asarray(y, dtype=float)
+
+    # Do not send invalid vectors to R.
+    if (
+        y.ndim != 1
+        or y.size < 2 * minseglen
+        or not np.all(np.isfinite(y))
+        or np.nanstd(y) < 1e-12
+    ):
+        return None, np.array([], dtype=int), {}
+
+    try:
+        res = fn(ro.FloatVector(y), minseglen=minseglen)
+    except Exception:
+        return None, np.array([], dtype=int), {}
 
     # Pull out model name
     mn = res.rx2('model_name')
@@ -145,22 +165,20 @@ def run_ts_with_r(y, fn, minseglen=24):
         model = None
 
     # Get index of changepoints
-    # If sole index = len(y) - 1, then no changepoint is identified
-    cp_idx = np.array(list(map(int, res.rx2('changepoints'))))
+    cp_idx = np.array(list(map(int, res.rx2('changepoints'))), dtype=int)
 
-    # Get parameter names (will depend on fitted model)
+    # Get parameter names
     params_r = res.rx2('params')
     names_r = params_r.names
     if isinstance(names_r, NULLType) or names_r is ro.NULL:
-        param_names = []
+        param_names_r = []
     else:
-        param_names = [str(n) for n in list(names_r)]  # python list of strings
+        param_names_r = [str(n) for n in list(names_r)]
 
     # Put values of parameters into dictionary
-    # There will be a set of parameters for each segment around a changepoint
     param_dict = {}
-    for p in param_names:
-        param_dict[p] = params_r.rx2['%s' % p]
+    for p in param_names_r:
+        param_dict[p] = params_r.rx2(p)
 
     return model, cp_idx, param_dict
 
@@ -174,6 +192,27 @@ def _fill_param_array(param_vals, i, j, segs, model_name, pdict):
     """
     m = (model_name or "").lower()
 
+
+    # beta: contains mean or trend, and ar(1) information
+    if 'beta' in pdict and np.asarray(pdict['beta']).size:
+        B = np.asarray(pdict['beta'], dtype=float)
+        B = B.reshape((B.shape[0], -1))  # (segments, ncols)
+        col_names = BETA_ORDER.get(m)
+
+        if col_names is not None:
+            rows = min(segs, B.shape[0])
+            for c, pname in enumerate(col_names):
+                if c >= B.shape[1]:
+                    continue
+                pi = param_idx_dict[pname]
+                param_vals[pi, :rows, i, j] = B[:rows, c]
+
+    # variance (sig2) - one value per segment
+    if 'sig2' in pdict and np.asarray(pdict['sig2']).size:
+        v = np.asarray(pdict['sig2'], dtype=float).ravel()
+        rows = min(segs, v.size)
+        param_vals[param_idx_dict['sig2'], :rows, i, j] = v[:rows]
+    """ TMP
     # beta: contains mean or trend, and ar(1) information
     if 'beta' in pdict and pdict['beta'].size:
         B = np.asarray(pdict['beta'], dtype=float)
@@ -190,7 +229,7 @@ def _fill_param_array(param_vals, i, j, segs, model_name, pdict):
         v = np.asarray(pdict['sig2'], dtype=float).ravel()
         rows = min(segs, v.size)
         param_vals[param_idx_dict['sig2'], :rows, i, j] = v[:rows]
-
+    """
 
 def return_changepoint_info(da, fn, max_cps=5, minseglen=24):
     """
@@ -230,8 +269,13 @@ def return_changepoint_info(da, fn, max_cps=5, minseglen=24):
             # Pull out time series to check
             y = np.asarray(da[:, i, j].values, dtype=float)
 
-            # Check if time series has enough data
-            if not np.sum(np.isnan(y)) < (2 * minseglen):
+            # Check if time series is safe to send to R
+            if (
+                y.ndim != 1
+                or y.size < 2 * minseglen
+                or not np.all(np.isfinite(y))
+                or np.nanstd(y) < 1e-12
+            ):
                 continue
 
             # Fit model from EnvCpt
@@ -351,23 +395,28 @@ def fit_cp_model(ts, no_cp_idx, cp_idxs, model_code):
     for j in range(ncp):  # loop through changepoints
 
         cpi = cp_idxs[j]
-
-        # skip masked and places with no changepoint identifies
+        
+        # skip masked and places with no changepoint identified
         if cpi == no_cp_idx or cpi < 0:
             continue
 
         if j == 0:
-            # first changepoint
             bef = slice(0, cpi)
         else:
             bef = slice(cp_idxs[j - 1], cpi)
 
-        if ncp == 2:
-            # case of no additional changepoint
+        # The next cp can be the end-of-record marker or padding.
+        # In those cases, fit the "after" segment through the end of ts.
+        if j == (ncp - 1):
             aft = slice(cpi, ntime)
         else:
-            aft = slice(cpi, cp_idxs[j + 1])
+            next_cpi = cp_idxs[j + 1]
 
+            if next_cpi == no_cp_idx or next_cpi < 0:
+                aft = slice(cpi, ntime)
+            else:
+                aft = slice(cpi, next_cpi)
+    
         if model_code == 4:
             # constant mean before/after
             m1 = np.nanmean(ts[bef])
@@ -431,33 +480,49 @@ def get_delta_mag(ds_cp_info, delta_norm):
     return da_delta_at_cp, fitted_da
 
 
-def add_synth_cp(da, sigma, minseglen, mu=0, seed=123):
+def add_synth_cp(
+    da, sigma, minseglen, n_cp=1, mu=0, seed=123,
+    same_cp_mag=False, cp_mag_value=None
+):
     """
-    Add a changepoint of magnitude drawn from Normal(mu, sigma) randomly to each gridcell.
-    The time of the changepoint is drawn uniformly from the available time indices, excepting
-    the first and last segments of length minseglen, since we cannot detect these.
+    Add user-specified number of changepoints to each grid cell.
+
+    Changepoint times are drawn randomly for each grid cell subject to all
+    segments having length at least minseglen.
+
+    By default, each changepoint magnitude is drawn independently from
+    Normal(mu, sigma). If same_cp_mag=True, all changepoints across all grid
+    cells have the same magnitude. If cp_mag_value is provided, that value is
+    used; otherwise one magnitude is drawn from Normal(mu, sigma).
 
     Parameters
     ----------
     da : xr.DataArray
         3D array with dims ('time', 'lat', 'lon'). Time should be monthly.
     sigma : float
-        Standard deviation of the Gaussian noise to create changepoints.
+        Standard deviation of the Gaussian distribution for changepoint magnitudes.
     minseglen : int
-        Miniumum segment length for CPs
+        Minimum segment length between changepoints and at the endpoints.
+    n_cp : int
+        Number of changepoints to add per grid cell.
     mu : float
-        Mean of changepoints.
+        Mean of changepoint magnitudes.
     seed : int
         Random seed for reproducibility.
+    same_cp_mag : bool
+        If True, all changepoints have the same signed magnitude.
+    cp_mag_value : float or None
+        If provided with same_cp_mag=True, use this magnitude for all changepoints.
+        If None, draw one shared magnitude from Normal(mu, sigma).
 
     Returns
     -------
     da_with_cp : xr.DataArray
-        Original da with artificial changepoints (time x lat x lon).
+        Original da with artificial changepoints added (time x lat x lon).
     t_idx : xr.DataArray
-        Index (integer) of changepoint time for each grid cell (lat x lon).
-    cp_2d : xr.DataArray
-        Changepoint magnitude (lat x lon).
+        Integer changepoint indices with dims ('cp', 'lat', 'lon').
+    cp_mag : xr.DataArray
+        Changepoint magnitudes with dims ('cp', 'lat', 'lon').
     """
     rng = np.random.default_rng(seed)
 
@@ -465,36 +530,103 @@ def add_synth_cp(da, sigma, minseglen, mu=0, seed=123):
     nlat = da.sizes['lat']
     nlon = da.sizes['lon']
 
-    minseglen = int(minseglen)  # convert in case
+    minseglen = int(minseglen)
+    n_cp = int(n_cp)
 
-    # Random time index for each (lat, lon)
+    if n_cp < 0:
+        raise ValueError('n_cp must be non-negative')
+
+    if n_cp == 0:
+        t_idx = xr.DataArray(
+            np.empty((0, nlat, nlon), dtype=int),
+            dims=('cp', 'lat', 'lon'),
+            coords={'cp': [], 'lat': da['lat'], 'lon': da['lon']}
+        )
+
+        cp_mag = xr.DataArray(
+            np.empty((0, nlat, nlon)),
+            dims=('cp', 'lat', 'lon'),
+            coords={'cp': [], 'lat': da['lat'], 'lon': da['lon']}
+        )
+
+        return da.copy(), t_idx, cp_mag
+
+    if ntime < (n_cp + 1) * minseglen:
+        raise ValueError(
+            f'Not enough time points for {n_cp} changepoints with '
+            f'minseglen={minseglen}. Need at least {(n_cp + 1) * minseglen}, '
+            f'but got ntime={ntime}.'
+        )
+
+    # Draw changepoint indices independently for each grid cell.
+    # Validity requires:
+    #   t1 >= minseglen
+    #   t2 - t1 >= minseglen
+    #   ...
+    #   ntime - t_last >= minseglen
+    t_idx_vals = np.empty((n_cp, nlat, nlon), dtype=int)
+
+    extra = ntime - (n_cp + 1) * minseglen
+
+    for i in range(nlat):
+        for j in range(nlon):
+            # Randomly distribute the extra time points across segments.
+            # There are n_cp + 1 segments around n_cp changepoints.
+            cuts = np.sort(rng.choice(extra + n_cp, size=n_cp, replace=False))
+            extras = np.diff(np.r_[-1, cuts, extra + n_cp]) - 1
+
+            seg_lengths = minseglen + extras
+            t_idx_vals[:, i, j] = np.cumsum(seg_lengths)[:-1]
+
     t_idx = xr.DataArray(
-        rng.integers(low=minseglen, high=(ntime - minseglen), size=(nlat, nlon)),
-        dims=('lat', 'lon'),
-        coords={'lat': da['lat'], 'lon': da['lon']}
+        t_idx_vals,
+        dims=('cp', 'lat', 'lon'),
+        coords={
+            'cp': np.arange(n_cp),
+            'lat': da['lat'],
+            'lon': da['lon']
+        }
     )
 
-    # Convert those indices to actual time labels (datetime64)
-    t_pick = da['time'].isel(time=t_idx)  # dims ('lat','lon'), dtype datetime64
+    # Changepoint magnitudes
+    if same_cp_mag:
+        if cp_mag_value is None:
+            shared_mag = rng.normal(loc=mu, scale=sigma)
+        else:
+            shared_mag = cp_mag_value
 
-    # One changepoint magnitude per grid cell
-    cp_2d = xr.DataArray(
-        rng.normal(loc=mu, scale=sigma, size=(nlat, nlon)),
-        dims=('lat', 'lon'),
-        coords={'lat': da['lat'], 'lon': da['lon']}
+        cp_mag_vals = np.full((n_cp, nlat, nlon), shared_mag)
+
+    else:
+        cp_mag_vals = rng.normal(
+            loc=mu,
+            scale=sigma,
+            size=(n_cp, nlat, nlon)
+        )
+
+    cp_mag = xr.DataArray(
+        cp_mag_vals,
+        dims=('cp', 'lat', 'lon'),
+        coords={
+            'cp': np.arange(n_cp),
+            'lat': da['lat'],
+            'lon': da['lon']
+        }
     )
 
-    # Mask for all times at or after the changepoint
-    # This broadcasts to (time, lat, lon):
+    # Convert changepoint indices to datetime labels
+    t_pick = da['time'].isel(time=t_idx)
+
+    # Broadcast to ('time', 'cp', 'lat', 'lon')
     step_mask = da['time'] >= t_pick
 
-    # Expand cp_2d in time and apply step mask → step change
-    cp_3d = cp_2d.expand_dims(time=da['time']) * step_mask
+    # Sum contributions from all changepoints
+    cp_signal = (cp_mag * step_mask).sum('cp')
 
     # Add to original
-    da_with_cp = da + cp_3d
+    da_with_cp = da + cp_signal
 
-    return da_with_cp, t_idx, cp_2d
+    return da_with_cp, t_idx, cp_mag
 
 
 def make_synthetic_ts(time, trend_per_year, phi, sigma_monthly):
