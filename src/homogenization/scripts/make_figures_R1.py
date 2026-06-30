@@ -719,12 +719,10 @@ base_str_info = (
     "ds_cp_info_ERA5_Q2m_1x1_1980-2024_minus_"
     "CESM2_QREFHT_1x1_1980-2024_modelmeanar1-trendar1"
 )
-data_names = [
-    "_max3_minseg60_std",
-    "_max10_minseg60_std",
-    "_max5_minseg12_std",
-]
-titles = ["Max 3 CPs", "Max 10 CPs", "Minimum segment = 1 year"]
+
+data_names = ['_max5_minseg12_std', '_max5_minseg60_std']
+titles = ['Minimum segment = 1 year', 'Minimum segment = 5 years']
+
 n_data = len(data_names)
 nrows = n_data + 1
 ncols = 3
