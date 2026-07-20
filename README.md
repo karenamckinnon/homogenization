@@ -4,6 +4,9 @@ Code to homogenize ERA5 and HadISDH near-surface specific humidity data using PE
 
 The PELT homogenization is performed using the EnvCpt package: https://cran.r-project.org/web/packages/EnvCpt/index.html
 
+[![DOI](https://zenodo.org/badge/162333713.svg)](https://doi.org/10.5281/zenodo.4422003)
+
+
 ## Credits
 
 This package was created with [Cookiecutter](https://github.com/audreyfeldroy/cookiecutter) and the [audreyfeldroy/cookiecutter-pypackage](https://github.com/audreyfeldroy/cookiecutter-pypackage) project template.
